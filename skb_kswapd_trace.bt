@@ -1,0 +1,108 @@
+#!/usr/bin/env bpftrace
+/* SPDX-License-Identifier: GPL-2.0-only */
+/*
+ * skb_kswapd_trace.bt
+ *
+ * A deterministic tracing script to prove that network high-order 
+ * allocation failures correctly fall back to order-0, yet still 
+ * unnecessarily wake up kswapd, leading to the 100% CPU lockup bug.
+ *
+ * Strategy:
+ * 1. Context Isolation: We tag the specific thread (tid) entering 
+ * skb_page_frag_refill() to filter out all background noise.
+ * 2. Stable Tracepoints: We use official tracepoints (kmem, vmscan) 
+ * to bypass inline/notrace limitations of __alloc_pages.
+ * 3. Fallback Deduction: By observing the final 'order' obtained upon
+ * exiting the refill function, we can definitively deduce whether a
+ * high-order request failed and fell back to order-0.
+ */
+
+BEGIN
+{
+    printf("================================================================================\n");
+    printf(" Tracing Network SKB Fallback & kswapd Wakes (Tracepoint Edition). Hit Ctrl-C.\n");
+    printf("================================================================================\n");
+    printf("%-10s %-16s %-7s %-14s %s\n", "TIME", "COMM", "PID", "EVENT", "DETAILS");
+}
+
+/* * Step 1: Mark the entry into the network socket refill context.
+ * We use 'tid' to ensure we strictly track allocations triggered by this specific path.
+ */
+kprobe:skb_page_frag_refill
+{
+    @in_skb_refill[tid] = 1;
+    @alloc_order[tid] = -1; /* -1 indicates no memory allocated yet */
+    @stat_enter++;
+}
+
+/* * Step 2: Capture successful physical page allocations.
+ * This filters out all system noise because of the /@in_skb_refill[tid]/ condition.
+ */
+tracepoint:kmem:mm_page_alloc
+/@in_skb_refill[tid]/
+{
+    /* args->order contains the actual order of the successfully allocated page */
+    @alloc_order[tid] = args->order;
+}
+
+/* * Step 3: The Deduction Engine.
+ * Evaluate what happened during the refill path upon exit.
+ */
+kretprobe:skb_page_frag_refill
+/@in_skb_refill[tid]/
+{
+    $order = @alloc_order[tid];
+
+    if ($order >= 1) {
+        /* Success: Got high-order memory (typically Order-3 or Order-1) */
+        @stat_ho_ok++;
+    } else if ($order == 0) {
+        /* * The Smoking Gun: The function intended to get high-order memory, 
+         * but exited with an order-0 page. This proves the high-order 
+         * allocation failed and it successfully fell back to order-0!
+         */
+        @stat_fb_ok++;
+        printf("%-10s %-16s %-7d %-14s High-Order FAILED -> Fallback to Order-0 SUCCESS\n",
+               strftime("%H:%M:%S", nsecs), comm, pid, "[FALLBACK_OK]");
+    } else {
+        /* -1 means complete allocation failure (OOM condition for this request) */
+        @stat_all_fail++;
+    }
+
+    /* Strict cleanup to prevent memory leaks in BPF maps */
+    delete(@alloc_order[tid]);
+    delete(@in_skb_refill[tid]);
+}
+
+/* * Step 4: Capture the kswapd wakeup event triggered BY this specific network thread.
+ */
+tracepoint:vmscan:mm_vmscan_wakeup_kswapd
+/@in_skb_refill[tid]/
+{
+    @stat_kswapd_wakes++;
+    printf("%-10s %-16s %-7d %-14s \033[31m-> WAKING KSWAPD DUE TO PRESSURE! (order=%d)\033[0m\n",
+           strftime("%H:%M:%S", nsecs), comm, pid, "[WAKE_KSWAPD]", args->order);
+}
+
+END
+{
+    printf("\n================================================================================\n");
+    printf("                               Trace Statistics                                 \n");
+    printf("================================================================================\n");
+    printf(" 1. skb_page_frag_refill total calls     : %d\n", @stat_enter);
+    printf(" 2. High-Order (O3) direct SUCCESS       : %d\n", @stat_ho_ok);
+    printf(" 3. High-Order FAILED -> Order-0 FALLBACK: %d\n", @stat_fb_ok);
+    printf(" 4. Complete allocation failures         : %d\n", @stat_all_fail);
+    printf(" 5. kswapd wakeups from socket backlog   : %d\n", @stat_kswapd_wakes);
+    printf("================================================================================\n");
+
+    /* Cleanup global maps */
+    clear(@in_skb_refill);
+    clear(@alloc_order);
+    
+    clear(@stat_enter);
+    clear(@stat_ho_ok);
+    clear(@stat_fb_ok);
+    clear(@stat_all_fail);
+    clear(@stat_kswapd_wakes);
+}
