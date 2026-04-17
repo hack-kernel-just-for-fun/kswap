@@ -16,6 +16,7 @@ Minimal reproducer setup for observing `kswapd` behavior under network high-orde
 - `skb_kswapd_trace.bt`  
   bpftrace script for tracing network TX/RX path high-order allocation failures and fallback to `order-0` allocations.
 
+
 ## Goal
 
 This setup is used to reproduce and inspect scenarios where high-order allocation pressure persists (especially around `order-3`) 
@@ -23,6 +24,7 @@ and to correlate allocator fallback behavior with `kswapd` activity.
 
 ## Quick notes
 - Use `skb_kswapd_trace.bt` while running the reproducer to observe fallback events in real time.
+- bpftrace --version bpftrace v0.23.5
 
 ## Result
 ```bash
